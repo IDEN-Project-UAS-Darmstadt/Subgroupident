@@ -9,6 +9,8 @@ This script should be run with R version 4.4.3. The following commands can be us
 
 ```sh
 curl -LsSf https://r-lib.github.io/rig/install.sh | sh
+# reopen your terminal
+
 rig system user-mode
 rig add 4.4.3
 rig default 4.4.3

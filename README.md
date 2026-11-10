@@ -16,8 +16,10 @@ rig add 4.4.3
 rig default 4.4.3
 # reopen your terminal
 
-# We require R Markdown
+# We require R Markdown, renv and pandoc
 rig pkg install rmarkdown@=2.31 renv@=1.1.7
+sudo apt update
+sudo apt install pandoc
 ```
 
 ## Running

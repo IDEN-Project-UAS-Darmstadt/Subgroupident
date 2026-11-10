@@ -17,7 +17,7 @@ rig default 4.4.3
 # reopen your terminal
 
 # We require R Markdown, renv and pandoc
-rig pkg install rmarkdown@=2.31 renv@=1.1.7
+rig pkg install renv@=1.1.7
 sudo apt update
 sudo apt install pandoc
 ```
@@ -52,4 +52,4 @@ Rscript run_simulation_study.R MOB marginal null minf
 
 Run results are written to the folder "results" 
 
-Child simulation processes may keep running when force quitting the parent process. These can be stopped with `killall R`.  
+Child simulation processes may keep running when force quitting the parent process. These can be stopped with `killall R`.

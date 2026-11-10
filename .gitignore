@@ -1,0 +1,39 @@
+results
+
+# R session files
+.Rhistory
+.RData
+.Ruserdata
+
+# RStudio project files
+.Rproj.user/
+*.Rproj
+
+# R Markdown / knitr generated files
+*_cache/
+*_files/
+*.utf8.md
+*.knit.md
+
+# Rendered output (optional - ignore if generated)
+*.html
+*.pdf
+*.docx
+
+# Quarto
+.quarto/
+_freeze/
+
+# Package build/check files
+.Rcheck/
+*.tar.gz
+*.Rcheck/
+.Rbuildignore
+
+# R package documentation
+man/
+NAMESPACE
+
+# OS-generated files
+.DS_Store
+Thumbs.db

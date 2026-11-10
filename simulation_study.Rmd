@@ -1,0 +1,1322 @@
+---
+title: "Simulation study for ABC algorithm in combination with MOB for subgroup identification"
+author: "Henrik Stahl"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    df_print: paged
+    code_folding: hide
+    self_contained: true
+    toc_float: true
+    keep_md: false
+params:
+  method: "MOB"
+  model: "marginal"
+  true_model: "moderate"
+  abc_model: "linf"
+  outdir: "."
+---
+
+```{r, setup, eval=T, include=FALSE}
+start_script <- Sys.time()
+options(keep.source = TRUE)
+if (!interactive()) {
+  options(error = traceback)
+}
+
+knitr::opts_chunk$set(echo = TRUE, message = NA, warnings = NA)
+load_libraries <- function() {
+  library(survival)
+  library(ggfortify)
+  library(glmnet)
+  library(partykit)
+  library(ggplot2)
+  library(ggExtra)
+  library(ggpubr)
+  library(tidyverse)
+  library(pbapply)
+  library(parallel)
+  library(evaluate)
+  library(stringr)
+  library(rlang)
+  library(latex2exp)
+  library(profvis)
+  library(htmlwidgets)
+  library(sandwich) # necessary for 'estfun' method
+  library(strucchange)
+  library(calculus)
+  library(cubature)
+  library(memoise)
+  library(forcats)
+  library(data.table)
+  library(patchwork)
+  library(CensRCalc)
+  library(truncnorm)
+}
+load_libraries()
+
+source("ident_subgrs.R")
+```
+
+# Parameters for models and simulation
+
+## Simulation parameters
+
+```{r, set_params, eval = T, echo = T}
+if (exists("params")) {
+  method <- params$method
+  model <- params$model
+  true_model <- params$true_model
+  abc_model <- params$abc_model
+  outdir <- params$outdir
+} else {
+  method <- "MOB"
+  model <- "marginal"
+  true_model <- "moderate"
+  abc_model <- "linf"
+  outdir <- str_glue("results_ind_realistic_model/{substr(Sys.time(), 1, 19)}_results_survival_{method}_{model}")
+}
+
+estimator <- "mean"
+```
+
+```{r, simulation_parameters, eval = T}
+# size of study population
+n <- 100
+
+# number of (full) iterations
+K <- 10^3
+
+# number of ABC simulations
+N <- 10^6
+
+# precision
+epsilon <- 0.05
+
+# administrative censoring time
+cens_admin <- 3
+
+# recruitment time
+time_accr <- 1
+
+# goal for censoring proportion
+cens_prop_goal <- 0.3
+
+# use total
+total <- TRUE
+
+# threshold for subgroup: X3 > d_subgr_obs
+d_subgr_obs <- 0.5 # 0.75
+
+# threshold for subgroup in LASSO
+d_ite_lasso <- 0.6
+
+# minimum number of accepted cate_abc_true
+d_min_post <- 100 # 100
+
+# proportion factors for "subgroup too small/large"
+d_subgr_small <- 0.2
+d_subgr_large <- 0.8
+
+# threshold for different subgroup sizes
+d_subgr_size <- 10
+
+# minimum CATE in population for subgroup selection
+d_cate_pop <- 0.75
+
+# factor for "effect in subgroup not good enough"
+M <- 0.7
+
+# True model parameters
+## Parameters beta1 and beta2 calculated so that the range of true ITEs in the true subgroup is in [a, b]
+beta0_obs_true <- 1
+beta2_obs_true <- 1.5
+beta3_obs_true <- 0 # nuissance parameter
+
+if (true_model == "strong") {
+  a <- 0.3
+  b <- 0.7
+  beta1_obs_true <- log(b / a^d_subgr_obs) / (1 - d_subgr_obs)
+  beta4_obs_true <- log(a / b) / (1 - d_subgr_obs)
+} else if (true_model == "moderate") {
+  a <- 0.65
+  b <- 0.85
+  beta1_obs_true <- log(b / a^d_subgr_obs) / (1 - d_subgr_obs)
+  beta4_obs_true <- log(a / b) / (1 - d_subgr_obs)
+} else if (true_model == "null") {
+  a <- "null"
+  b <- "null"
+  beta1_obs_true <- -0.15
+  beta4_obs_true <- 0
+}
+
+betas_obs_true <- c(beta0_obs_true, beta1_obs_true, beta2_obs_true, beta3_obs_true, beta4_obs_true)
+
+if (abc_model == "ideal") {
+  beta0_abc_prior <- beta0_obs_true
+  beta1_abc_prior <- beta1_obs_true
+  beta2_abc_prior <- beta2_obs_true
+  beta3_abc_prior <- beta3_obs_true
+  beta4_abc_prior <- beta4_obs_true
+  betas_abc_prior <- c(beta0_abc_prior, beta1_abc_prior, beta2_abc_prior, beta3_abc_prior, beta4_abc_prior)
+
+  # ABC model parameters
+  beta0_abc_sd <- 0.25 # 1 #0.5 # 0.25
+  beta1_abc_sd <- 0.2 # 1 #0.5 # 0.25
+  beta2_abc_sd <- 0.15 # 1 #0.5 # 0.25
+  beta3_abc_sd <- 0.15 # 1 #0.5 # 0.25
+  beta4_abc_sd <- 0.25 # 1 #0.5 # 0.25
+  betas_abc_var <- c(beta0_abc_sd, beta1_abc_sd, beta2_abc_sd, beta3_abc_sd, beta4_abc_sd)
+
+  lower_bound <- -Inf
+  upper_bound <- Inf
+} else if (abc_model == "linf") {
+  # linf model parameters
+  beta0_abc_prior <- 1
+  beta1_abc_prior <- 0 #-0.2 #0 #0.1 #log(b/a^d_subgr_obs)/(1-d_subgr_obs)
+  beta2_abc_prior <- 0.2 # 0.2 #0 #1.5 #0
+  beta3_abc_prior <- 0.2 #-0.4 #0 #1.5 #0 nuissance parameter
+  beta4_abc_prior <- 0.2 # 0.2 #0 #1.5 #0 #log(a/b)/(1-d_subgr_obs)
+  beta5_abc_prior <- -0.2 #-1.5 #0
+  beta6_abc_prior <- -0.2 #-1.5 #0
+  beta7_abc_prior <- -0.2 #-1.5 #0
+  betas_abc_prior <- c(beta0_abc_prior, beta1_abc_prior, beta2_abc_prior, beta3_abc_prior, beta4_abc_prior, beta5_abc_prior, beta6_abc_prior, beta7_abc_prior)
+
+  beta0_abc_sd <- 0.5 # 1 #0.5 # 0.25
+  beta1_abc_sd <- 0.35 # 1 #0.5 # 0.25
+  beta2_abc_sd <- 0.25 # 1 #0.5 # 0.25
+  beta3_abc_sd <- 0.25 # 1 #0.5 # 0.25
+  beta4_abc_sd <- 0.5 # 1 #0.5 # 0.25
+  beta5_abc_sd <- 0.3 # 1 #0.5 # 0.25
+  beta6_abc_sd <- 0.3 # 1 #0.5 # 0.25
+  beta7_abc_sd <- 0.6 # 1 #0.5 # 0.25
+  betas_abc_var <- c(beta0_abc_sd, beta1_abc_sd, beta2_abc_sd, beta3_abc_sd, beta4_abc_sd, beta5_abc_sd, beta6_abc_sd, beta7_abc_sd)
+
+  lower_bound <- -Inf
+  upper_bound <- Inf
+} else if (abc_model == "minf") {
+  # minf model parameters
+  beta0_abc_prior <- 1
+  beta1_abc_prior <- 0 #-0.2 #0 #0.1 #log(b/a^d_subgr_obs)/(1-d_subgr_obs)
+  beta2_abc_prior <- 0.2 # 0.2 #0 #1.5 #0
+  beta3_abc_prior <- 0.2 #-0.4 #0 #1.5 #0 nuissance parameter
+  beta4_abc_prior <- 0.2 # 0.2 #0 #1.5 #0 #log(a/b)/(1-d_subgr_obs)
+  beta5_abc_prior <- 0 #-1.5 #0
+  beta6_abc_prior <- 0 #-1.5 #0
+  beta7_abc_prior <- -0.3 #-0.8 #-1.5 #0
+  betas_abc_prior <- c(beta0_abc_prior, beta1_abc_prior, beta2_abc_prior, beta3_abc_prior, beta4_abc_prior, beta5_abc_prior, beta6_abc_prior, beta7_abc_prior)
+
+  beta0_abc_sd <- 0.5 # 1 #0.5 # 0.25
+  beta1_abc_sd <- 0.35 # 1 #0.5 # 0.25
+  beta2_abc_sd <- 0.25 # 1 #0.5 # 0.25
+  beta3_abc_sd <- 0.25 # 1 #0.5 # 0.25
+  beta4_abc_sd <- 0.5 # 1 #0.5 # 0.25
+  beta5_abc_sd <- 0.3 # 1 #0.5 # 0.25
+  beta6_abc_sd <- 0.3 # 1 #0.5 # 0.25
+  beta7_abc_sd <- 0.6 # 1 #0.5 # 0.25
+  betas_abc_var <- c(beta0_abc_sd, beta1_abc_sd, beta2_abc_sd, beta3_abc_sd, beta4_abc_sd, beta5_abc_sd, beta6_abc_sd, beta7_abc_sd)
+
+  lower_bound <- -Inf
+  upper_bound <- Inf
+}
+
+alpha <- 1
+
+lambda_event_obs <- \(x1, x2, x3, trt) exp(-(betas_obs_true[1] + betas_obs_true[2] * trt + betas_obs_true[3] * x1 + betas_obs_true[4] * x2 + betas_obs_true[5] * I(x3 > d_subgr_obs) * x3 * trt) / alpha)
+
+if (abc_model == "ideal") {
+  lambda_event_abc <- \(x1, x2, x3, trt) exp(-(betas_abc_prior[1] + betas_abc_prior[2] * trt + betas_abc_prior[3] * x1 + betas_abc_prior[4] * x2 + betas_abc_prior[5] * I(x3 > d_subgr_obs) * x3 * trt) / alpha)
+} else if (abc_model == "linf" | abc_model == "minf") {
+  lambda_event_abc <- \(x1, x2, x3, trt) exp(-(betas_abc_prior[1] + betas_abc_prior[2] * trt + betas_abc_prior[3] * x1 + betas_abc_prior[4] * x2 + betas_abc_prior[5] * I(x3 > d_subgr_obs) * x3 * trt + betas_abc_prior[6] * trt * x1 + betas_abc_prior[7] * trt * x2 + betas_abc_prior[8] * trt * x3) / alpha)
+}
+
+event_surv_abc <- \(t, x1, x2, x3, trt) 1 - pweibull(t, shape = alpha, scale = lambda_event_abc(x1, x2, x3, trt))
+event_surv_obs <- \(t, x1, x2, x3, trt) 1 - pweibull(t, shape = alpha, scale = lambda_event_obs(x1, x2, x3, trt))
+
+cens_surv <- \(t, lambda_c) 1 - pexp(t, rate = lambda_c)
+cens_dens <- \(t, lambda_c) dexp(t, rate = lambda_c)
+
+cov_dens_obs <- \(x1, x2, x3, trt) dnorm(x1) * dnorm(x2) * dunif(x3, 0, 1) * dbinom(trt, 1, 0.5)
+cov_dens_abc <- \(x1, x2, x3, trt) dnorm(x1) * dnorm(x2) * dunif(x3, 0, 1) * dbinom(trt, 1, 0.5)
+
+cov_bounds_obs <- list(
+  x1 = c(-Inf, Inf),
+  x2 = c(-Inf, Inf),
+  x3 = c(0, 1),
+  trt = list(0, 1)
+)
+cov_bounds_abc <- list(
+  x1 = c(-Inf, Inf),
+  x2 = c(-Inf, Inf),
+  x3 = c(0, 1),
+  trt = list(0, 1)
+)
+
+set.seed(764872)
+start_cens_rate_obs_time <- Sys.time()
+progressr::with_progress({
+  cens_rate_obs <- CensRCalc::find_cens_param(cens_prop_goal, event_surv_obs, cov_dens_obs, cov_bounds_obs,
+    cens_surv, cens_dens,
+    time_admin_cens = cens_admin, time_accrual = time_accr, abs_tol = 1e-4
+  )
+}) # "simpleError 'length(milestones) > 0L' is not TRUE" is not a real issue here!
+rate_opt_true <- cens_rate_obs$parameter
+end_cens_rate_obs_time <- Sys.time()
+message(str_glue("Time to find optimal censoring rate for obs model: {round(difftime(end_cens_rate_obs_time, start_cens_rate_obs_time, units = 'mins'), 2)} minutes"))
+
+start_cens_rate_abc_time <- Sys.time()
+# rate_opt_abc <- rate_opt_true # activate only if obs and ABC model are similar
+progressr::with_progress({
+  cens_rate_abc <- CensRCalc::find_cens_param(cens_prop_goal, event_surv_abc, cov_dens_abc, cov_bounds_abc,
+    cens_surv, cens_dens,
+    time_admin_cens = cens_admin, time_accrual = time_accr, abs_tol = 1e-4
+  )
+})
+rate_opt_abc <- cens_rate_abc$parameter
+end_cens_rate_abc_time <- Sys.time()
+message(str_glue("Time to find optimal censoring rate for abc model: {round(difftime(end_cens_rate_abc_time, start_cens_rate_abc_time, units = 'mins'), 2)} minutes"))
+```
+
+```{r, determine_penalty_param, eval = T, echo = T}
+cores_determine <- max(1, parallel::detectCores() - 2)
+
+# ONLY VALID FOR CURRENT OBS MODEL!
+res <- pblapply(1:10000, function(i) {
+  set.seed(764872 + i) # should this be a different seed than used in sim_obs?
+
+  # Generate covariates
+  X1 <- rnorm(n, mean = 0, sd = 1) # Normally distributed covariate
+  X2 <- rnorm(n, mean = 0, sd = 1) # Normally distributed covariate
+  X3 <- runif(n, min = 0, max = 1) # Uniformly distributed covariate
+
+  # Treatment assignment
+  trt <- sample(c(rep(1, n / 2), rep(0, n / 2))) # Randomly assign treatment
+
+  # Model parameters
+  lambda <- exp(-(betas_obs_true[1] + betas_obs_true[2] * trt + betas_obs_true[3] * X1 + betas_obs_true[4] * X2 + betas_obs_true[5] * I(X3 > d_subgr_obs) * X3 * trt) / alpha)
+
+  # Generate event times and censoring times
+  time_event <- rweibull(n, scale = lambda, shape = alpha) # Event times
+  time_cens_rand <- rexp(n, rate = rate_opt_true) # Random censoring times
+  time_cens_recr <- runif(n, cens_admin - time_accr, cens_admin) # Recruitment censoring times
+
+  # Determine observed times and censoring indicators
+  time_cens <- pmin(time_cens_rand, time_cens_recr) # Minimum of random and recruitment censoring times
+  time_obs <- pmin(time_event, time_cens) # Observed times are the minimum of event and censoring times
+  delta <- ifelse(time_event < time_cens, 1, 0) # Censoring indicator (1 if event, 0 if censored)
+
+  # Create data frame with observed data
+  df <- data.frame(id = seq(1, n), time = time_obs, cens = delta, X1 = X1, X2 = X2, X3 = X3, trt = trt)
+
+  # Calculate true overall treatment effect in population
+  cate_pop_true <- exp(mean(betas_obs_true[2] + betas_obs_true[5] * df$X3 * I(df$X3 > d_subgr_obs)))
+
+  if (method == "LASSO") {
+    formula <- as.formula("Surv(time, cens) ~ .^2") # .^2 # trt + X1 + X2 + X3:trt:I(X3>0.5)  #- X1:X2 - X1:X3 - X2:X3 # remove interaction terms that are not in the data
+  } else if (method == "MOB") {
+    formula <- as.formula("Surv(time, cens) ~ .-trt")
+  }
+  id <- df$id
+  df <- df %>% select(-id)
+  mat <- model.matrix(data = df, object = formula)
+
+  # set.seed(764872)
+  fit <- cv.glmnet(mat, Surv(df$time, df$cens), family = "cox", alpha = 1)
+  penalty_param_min <- fit$lambda.min
+  penalty_param_1se <- fit$lambda.1se
+
+  list(cate_pop_true = cate_pop_true, penalty_param_min = penalty_param_min, penalty_param_1se = penalty_param_1se)
+}, cl = cores_determine)
+
+cates_pop <- vapply(res, function(x) x$cate_pop_true, numeric(1))
+penalty_params_min <- vapply(res, function(x) x$penalty_param_min, numeric(1))
+penalty_params_1se <- vapply(res, function(x) x$penalty_param_1se, numeric(1))
+
+# penalty_param for LASSO regression
+penalty_param <- mean(penalty_params_min) # more liberal threshold, i.e. less regularization, more variables selected, more likely to select a subgroup that is different from the overall population
+# penalty_param <- mean(penalty_params_1se) # more conservative threshold, i.e. more regularization, less variables selected, more likely to select a subgroup that is not too different from the overall population
+
+# threshold for "populations too different"
+d_cates_pop_diff <- 0.2
+```
+
+```{r, create_params_txt, eval = T, echo = T}
+sink(file.path(outdir, "params.txt"))
+cat("method:", method, "\n")
+cat("estimation model:", model, "\n")
+cat("true model:", true_model, "\n")
+cat("abc model:", abc_model, "\n")
+cat("n:", n, "\n")
+cat("K:", K, "\n")
+cat("N:", N, "\n")
+cat("epsilon:", epsilon, "\n")
+cat("cens_admin:", cens_admin, "\n")
+cat("time_accr:", time_accr, "\n")
+cat("cens_prop_goal:", cens_prop_goal, "\n")
+cat("total:", total, "\n")
+cat("d_subgr_obs:", d_subgr_obs, "\n")
+cat("d_ite_lasso:", d_ite_lasso, "\n")
+cat("d_cates_pop_diff:", d_cates_pop_diff, "\n")
+cat("d_min_post:", d_min_post, "\n")
+cat("d_subgr_small:", d_subgr_small, "\n")
+cat("d_subgr_large:", d_subgr_large, "\n")
+cat("d_subgr_size:", d_subgr_size, "\n")
+cat("d_cate_pop:", d_cate_pop, "\n")
+cat("M:", M, "\n")
+cat("a:", a, "\n")
+cat("b:", b, "\n")
+cat("lower_bound:", lower_bound, "\n")
+cat("upper_bound:", upper_bound, "\n")
+cat("penalty param:", penalty_param, "\n")
+cat("rate_opt_true:", rate_opt_true, "\n")
+cat("rate_opt_abc:", rate_opt_abc, "\n")
+cat("beta0_obs_true:", beta0_obs_true, "\n")
+cat("beta1_obs_true:", beta1_obs_true, "\n")
+cat("beta2_obs_true:", beta2_obs_true, "\n")
+cat("beta3_obs_true:", beta3_obs_true, "\n")
+cat("beta4_obs_true:", beta4_obs_true, "\n")
+betas <- setdiff(ls()[grep("^beta.+", ls())], c("betas_abc_prior", "betas_abc_var"))
+for (beta in betas) {
+  if (grepl("abc", beta)) {
+    cat(beta, ": ", get(beta), "\n", sep = "")
+  }
+}
+sink()
+```
+
+```{r, create_output_directory, eval=T, echo=T}	
+dir.create(path = outdir, showWarnings = FALSE)
+```
+
+```{r, error_functions ,eval=T, echo=T}
+handler <- function(e, sim, subject) {
+  message <- conditionMessage(e)
+  if (str_detect(message, fixed("converge"))) {
+    return(str_glue("{subject} in {sim} did not converge"))
+  } else if (str_detect(message, fixed("from glmnet C++ code (error code -"))) {
+    return(str_glue("{subject} in {sim} glmnet numerical error"))
+  } else if (str_detect(message, fixed("non-missing arguments"))) {
+    return(str_glue("{subject} in {sim} no observations"))
+  } else if (str_detect(message, fixed("No (non-missing) observations"))) {
+    return(str_glue("{subject} in {sim} no observations"))
+  } else if (str_detect(message, fixed("probably too many censored observations"))) {
+    return(str_glue("{subject} in {sim} too many censored observations"))
+  } else {
+    stop(e)
+  }
+}
+
+error_reject <- function(res, error_message) {
+  res$rejected <- TRUE
+  res$rejection_reason <- error_message
+  return(res)
+}
+
+error_helper <- function(..., to_call) {
+  env <- environment()
+  try_capture_stack(quote(to_call(...)), env = env)
+}
+```
+
+```{r, subgroup_selection_function, eval=T, echo=T}
+select_subgr <- function(n, subgr, cate, cate_pop, cate_true, df, betas, d_subgr_small, d_subgr_large, d_cate_pop) {
+  minsize <- d_subgr_small * n # min size of the selected subgroup
+  maxsize <- d_subgr_large * n # max size of the selected subgroup
+
+  if ((nrow(subgr) < minsize) || (nrow(subgr) > maxsize) || (cate >= 1) || (cate > M * cate_pop) || (cate > d_cate_pop)) {
+    if (cate_pop < d_cate_pop) {
+      subgr <- df
+      cate <- cate_pop
+      cate_true <- exp(mean(betas[2] + betas[5] * subgr$X3 * I(subgr$X3 > d_subgr_obs)))
+    } else {
+      subgr <- data.frame()
+      cate <- NA
+      cate_true <- NA
+    }
+  }
+
+  return(list(subgr = subgr, cate = cate, cate_true = cate_true))
+}
+```
+
+```{r, obs_simulation, eval=T, echo=T}
+sim_obs <- function(i, n, betas_obs_true, cens_admin, time_accr, penalty_param, d_subgr_small, d_subgr_large, d_cate_pop, rate = rate_opt_true, method = c("LASSO", "MOB", "Cox"), model = c("marginal", "dependent", "full main")) {
+  method <- match.arg(method)
+  model <- match.arg(model)
+  options(warn = 2)
+  set.seed(764872 + i)
+  res <- data.frame(i = i)
+  res$rejected <- FALSE
+  res$rejection_reason <- NA
+
+  # Create data frame with observed data
+  # Generate covariates
+  X1 <- rnorm(n, mean = 0, sd = 1) # Normally distributed covariate
+  X2 <- rnorm(n, mean = 0, sd = 1) # Normally distributed covariate
+  X3 <- runif(n, min = 0, max = 1) # Uniformly distributed covariate
+
+  # Treatment assignment
+  trt <- sample(c(rep(1, n / 2), rep(0, n / 2))) # Randomly assign treatment
+
+  # Model parameters
+  lambda_obs <- exp(-(betas_obs_true[1] + betas_obs_true[2] * trt + betas_obs_true[3] * X1 + betas_obs_true[4] * X2 + betas_obs_true[5] * I(X3 > d_subgr_obs) * X3 * trt) / alpha)
+
+  # Generate event times and censoring times
+  time_event <- rweibull(n, scale = lambda_obs, shape = alpha) # Event times
+  time_cens_rand <- rexp(n, rate = rate) # Random censoring times
+  time_cens_recr <- runif(n, cens_admin - time_accr, cens_admin) # Recruitment censoring times
+
+  # Determine observed times and censoring indicators
+  time_cens <- pmin(time_cens_rand, time_cens_recr) # Minimum of random and recruitment censoring times
+  time_obs <- pmin(time_event, time_cens) # Observed times are the minimum of event and censoring times
+  delta <- ifelse(time_event < time_cens, 1, 0) # Censoring indicator (1 if event, 0 if censored)
+
+  # Create data frame with observed data
+  df_obs <- data.frame(id = seq(1, n), time = time_obs, cens = delta, X1 = X1, X2 = X2, X3 = X3, trt = trt)
+
+  # Calculate true overall treatment effect in population
+  res$cate_pop_true <- exp(mean(betas_obs_true[2] + betas_obs_true[5] * df_obs$X3 * I(df_obs$X3 > d_subgr_obs)))
+
+  # Calculate censoring proportion in each simulated dataset
+  res$cens_prop_true <- nrow(df_obs[df_obs$cens == 0, ]) / n
+
+  # Calculate true individual treatment effect (ITE)
+  # Could be used do define the true subgroup or compare ITE in true and observed subgroup
+  ite_true <- exp(betas_obs_true[2] + betas_obs_true[5] * df_obs$X3 * I(df_obs$X3 > d_subgr_obs))
+
+  # Define true subgroup
+  subgr_true <- df_obs[df_obs$X3 > d_subgr_obs, ] # Subgroup where X3 > d_subgr_obs
+
+  # Calculate conditional average treatment effect (CATE) in the true subgroup
+  if (nrow(subgr_true) == 0) {
+    subgr_true <- df_obs
+    res$cate_true <- res$cate_pop_true
+  } else {
+    res$cate_true <- exp(mean(betas_obs_true[2] + betas_obs_true[5] * subgr_true$X3 * I(subgr_true$X3 > d_subgr_obs)))
+  }
+
+  # Estimate trt effect in observed study population using marginal model
+  fit_pop_obs <- tryCatch(
+    coxph(data = df_obs, formula = Surv(time, cens) ~ trt, y = FALSE),
+    error = function(e) handler(e, "obs", "Cox")
+  )
+  if (is.character(fit_pop_obs)) {
+    return(error_reject(res, fit_pop_obs))
+  }
+
+  res$cate_pop_obs <- exp(coef(fit_pop_obs)["trt"])
+
+  # subgroup identification method on obs dataset
+  if (method == "LASSO") {
+    # Use LASSO on observed dataset
+    result_obs <- tryCatch(
+      ident_subgr_lasso(df_obs, d_ite = d_ite_lasso, penalty_param = penalty_param),
+      error = function(e) handler(e, "obs", "Cox-LASSO")
+    )
+    if (is.character(result_obs)) {
+      return(error_reject(res, result_obs))
+    }
+
+    subgr_obs <- result_obs$subgr
+    res$pred_correct_obs <- result_obs$pred_correct
+    nonzero_coefs_obs <- result_obs$nonzero_coefs
+    coefs_obs <- result_obs$coefs
+
+    coefs_obs_vec <- as.vector(coefs_obs)
+    names(coefs_obs_vec) <- paste0(rownames(coefs_obs), "_obs")
+    coefs_obs_df <- as.data.frame(t(coefs_obs_vec))
+    res <- cbind(res, coefs_obs_df)
+
+    res$penalty_param <- result_obs$penalty_param
+
+    # Calculate conditional average treatment effect (CATE) in the observed subgroup
+    if (nrow(subgr_obs) > 1) {
+      if (model == "full main") {
+        fit_obs <- tryCatch(
+          coxph(data = subgr_obs, formula = Surv(time, cens) ~ trt + X1 + X2 + X3, y = FALSE), #
+          error = function(e) handler(e, "obs", "Cox-LASSO CATE")
+        )
+        if (is.character(fit_obs)) {
+          return(error_reject(res, fit_obs))
+        }
+        res$cate_obs <- exp(coef(fit_obs)["trt"])
+      } else if (model == "dependent") {
+        fit_obs <- tryCatch(
+          exp(mean(log(subgr_obs$ite))),
+          error = function(e) handler(e, "obs", "Cox-MOB CATE")
+        )
+        if (is.character(fit_obs)) {
+          return(error_reject(res, fit_obs))
+        }
+        res$cate_obs <- fit_obs
+      } else if (model == "marginal") {
+        fit_obs <- tryCatch(
+          coxph(data = subgr_obs, formula = Surv(time, cens) ~ trt, y = FALSE),
+          error = function(e) handler(e, "obs", "Cox-LASSO CATE")
+        )
+        if (is.character(fit_obs)) {
+          return(error_reject(res, fit_obs))
+        }
+        res$cate_obs <- exp(coef(fit_obs)["trt"])
+      }
+      res$cate_obs_true <- exp(mean(betas_obs_true[2] + betas_obs_true[5] * subgr_obs$X3 * I(subgr_obs$X3 > d_subgr_obs)))
+    } else {
+      res$cate_obs <- NA
+      res$cate_obs_true <- NA
+    }
+  } else if (method == "MOB") {
+    result_obs <- tryCatch(
+      ident_subgr_mob(df_obs),
+      error = function(e) handler(e, "obs", "Cox-MOB")
+    )
+    if (is.character(result_obs)) {
+      return(error_reject(res, result_obs))
+    }
+
+    subgr_obs_list <- result_obs$subgr_list
+
+    coefs_obs_df_list <- lapply(result_obs$coefs_list, function(coefs) {
+      coefs_vec <- as.vector(coefs[[1]])
+      names(coefs_vec) <- paste0(names(coefs[[1]]), "_obs")
+      df_coefs <- as.data.frame(t(coefs_vec))
+      df_coefs$node <- coefs[[2]]
+      return(df_coefs)
+    })
+
+    coefs <- bind_rows(coefs_obs_df_list)
+
+    subgr_cate_obs_list <- lapply(subgr_obs_list, function(subgr) {
+      if (model == "full main") {
+        fit_obs <- tryCatch(
+          coxph(data = subgr[[1]], formula = Surv(time, cens) ~ trt + X1 + X2 + X3, y = FALSE),
+          error = function(e) handler(e, "obs", "Cox-MOB CATE")
+        )
+        if (is.character(fit_obs)) {
+          return(error_reject(res, fit_obs))
+        }
+        cate_obs <- exp(coef(fit_obs))["trt"]
+      } else if (model == "dependent") {
+        fit_obs <- tryCatch(
+          exp(coefs[coefs$node == subgr[[2]], "trt_obs"]),
+          error = function(e) handler(e, "obs", "Cox-MOB CATE")
+        )
+        if (is.character(fit_obs)) {
+          return(error_reject(res, fit_obs))
+        }
+        cate_obs <- fit_obs
+      } else if (model == "marginal") {
+        fit_obs <- tryCatch(
+          coxph(data = subgr[[1]], formula = Surv(time, cens) ~ trt, y = FALSE),
+          error = function(e) handler(e, "obs", "Cox-MOB CATE")
+        )
+        if (is.character(fit_obs)) {
+          return(error_reject(res, fit_obs))
+        }
+        cate_obs <- exp(coef(fit_obs))["trt"]
+      }
+      return(list(subgr = subgr[[1]], cate = cate_obs, node = subgr[[2]]))
+    })
+
+    cates_obs <- sapply(subgr_cate_obs_list, "[", 2)
+    selected <- subgr_cate_obs_list[[which.min(cates_obs)]]
+
+    subgr_obs <- selected$subgr
+    res$cate_obs <- selected$cate
+    node_subgr_obs <- selected$node
+
+    filter <- sapply(coefs_obs_df_list, function(df) {
+      if (df$node == node_subgr_obs) {
+        TRUE
+      } else {
+        FALSE
+      }
+    })
+    coefs_obs <- coefs_obs_df_list[filter]
+
+    res <- cbind(res, as.data.frame(coefs_obs))
+
+    res$cate_obs_true <- exp(mean(betas_obs_true[2] + betas_obs_true[5] * subgr_obs$X3 * I(subgr_obs$X3 > d_subgr_obs)))
+    res$pred_correct_obs <- result_obs$pred_correct
+    res$penalty_param <- result_obs$penalty_param
+    nonzero_coefs_obs <- result_obs$nonzero_coefs
+  } else if (method == "Cox") {
+    result_obs <- tryCatch(
+      ident_subgr_cox(df_obs, d_ite = d_ite_lasso),
+      error = function(e) handler(e, "obs", "Cox-LASSO")
+    )
+    if (is.character(result_obs)) {
+      return(error_reject(res, result_obs))
+    }
+
+    subgr_obs <- result_obs$subgr
+    res$pred_correct_obs <- result_obs$pred_correct
+    significant_coefs_obs <- result_obs$significant_coefs
+    coefs_obs <- result_obs$coefs
+
+    coefs_obs_vec <- as.vector(coefs_obs)
+    names(coefs_obs_vec) <- paste0(names(coefs_obs), "_obs")
+    coefs_obs_df <- as.data.frame(t(coefs_obs_vec))
+    res <- cbind(res, coefs_obs_df)
+
+    # Calculate conditional average treatment effect (CATE) in the observed subgroup
+    if (nrow(subgr_obs) > 1) {
+      if (model == "full main") {
+        fit_obs <- tryCatch(
+          coxph(data = subgr_obs, formula = Surv(time, cens) ~ trt + X1 + X2 + X3, y = FALSE), #
+          error = function(e) handler(e, "obs", "Cox-LASSO CATE")
+        )
+        if (is.character(fit_obs)) {
+          return(error_reject(res, fit_obs))
+        }
+        res$cate_obs <- exp(coef(fit_obs)["trt"])
+      } else if (model == "dependent") {
+        fit_obs <- tryCatch(
+          exp(mean(log(subgr_obs$ite))),
+          error = function(e) handler(e, "obs", "Cox-MOB CATE")
+        )
+        if (is.character(fit_obs)) {
+          return(error_reject(res, fit_obs))
+        }
+        res$cate_obs <- fit_obs
+      } else if (model == "marginal") {
+        fit_obs <- tryCatch(
+          coxph(data = subgr_obs, formula = Surv(time, cens) ~ trt, y = FALSE),
+          error = function(e) handler(e, "obs", "Cox-LASSO CATE")
+        )
+        if (is.character(fit_obs)) {
+          return(error_reject(res, fit_obs))
+        }
+        res$cate_obs <- exp(coef(fit_obs)["trt"])
+      }
+      res$cate_obs_true <- exp(mean(betas_obs_true[2] + betas_obs_true[5] * subgr_obs$X3 * I(subgr_obs$X3 > d_subgr_obs)))
+    } else {
+      res$cate_obs <- NA
+      res$cate_obs_true <- NA
+    }
+  } else {
+    stop("Method not supported")
+  }
+
+  res$subgr_size_before <- nrow(subgr_obs)
+
+  # Overlap between true and observed subgroup (only when a subgroup is observed! Cases where df_obs is selected as a subgroup are not included, therefore the discrepancy to rejection reason "No observed subgroup")
+  res$overlap_obs <- sum(subgr_obs$id %in% subgr_true$id)
+  if (nrow(subgr_obs) != 0) {
+    # how many patients of the true subgroup are actually selected, i.e. are in the observed subgroup?
+    res$sensitivity_obs <- res$overlap_obs / nrow(subgr_true)
+  } else {
+    res$sensitivity_obs <- NA
+  }
+  # how many patients of the observed subgroup are correctly selected, i.e. are in the true subgroup?
+  res$precision_obs <- res$overlap_obs / nrow(subgr_obs) # no check if nrow(subgr_obs) == 0 needed, because its automatically NaN
+
+  # selection rules for observed subgroup beyond ident_subgrs
+  if (!is.na(res$cate_obs)) {
+    subgr_cate_obs <- select_subgr(n, subgr_obs, res$cate_obs, res$cate_pop_obs, res$cate_obs_true, df_obs, betas_obs_true, d_subgr_small, d_subgr_large, d_cate_pop)
+    subgr_obs <- subgr_cate_obs$subgr
+    res$cate_obs <- subgr_cate_obs$cate
+    res$cate_obs_true <- subgr_cate_obs$cate_true
+  }
+
+  res$subgr_size_after <- nrow(subgr_obs)
+
+  # Overlap between true and observed subgroup (includes cases where df_obs is selected as a subgroup because subgr_obs is defined as such)
+  res$overlap_obs_broad <- sum(subgr_obs$id %in% subgr_true$id)
+  if (nrow(subgr_obs) != 0) {
+    # how many patients of the true subgroup are actually selected, i.e. are in the observed subgroup?
+    res$sensitivity_obs_broad <- res$overlap_obs_broad / nrow(subgr_true)
+  } else {
+    res$sensitivity_obs_broad <- NA
+  }
+  # how many patients of the observed subgroup are correctly selected, i.e. are in the true subgroup?
+  res$precision_obs_broad <- res$overlap_obs_broad / nrow(subgr_obs) # no check if nrow(subgr_obs) == 0 needed, because its automatically NaN
+
+  if (is.na(res$cate_obs)) {
+    res$rejected <- TRUE
+    res$rejection_reason <- "No observed subgroup"
+    return(res)
+  }
+
+  return(res)
+}
+```
+
+```{r, abc_simulation, eval=T, echo=T}
+sim_abc <- function(j, n, betas_abc_prior, betas_abc_var, cens_admin, time_accr, cate_pop_true, epsilon, penalty_param, d_subgr_small, d_subgr_large, d_cate_pop, lower_bound = lower_bound, upper_bound = upper_bound, rate = rate_opt_abc, method = c("LASSO", "MOB", "Cox"), model = c("marginal", "dependent", "full main"), abc_model = c("ideal", "linf", "minf")) {
+  method <- match.arg(method)
+  model <- match.arg(model)
+  abc_model <- match.arg(abc_model)
+  options(warn = 2)
+  # j <- 9387
+  # rate <- rate_opt_abc
+  set.seed(7648721 + j)
+  res <- data.frame(j = j)
+  res$rejected <- FALSE
+  res$rejection_reason <- NA
+
+  # Generate true beta coefficients for ABC simulation
+  beta0_abc_true <- rnorm(1, mean = betas_abc_prior[1], sd = betas_abc_var[1])
+  beta1_abc_true <- rnorm(1, mean = betas_abc_prior[2], sd = betas_abc_var[2])
+  beta2_abc_true <- rnorm(1, mean = betas_abc_prior[3], sd = betas_abc_var[3])
+  beta3_abc_true <- rnorm(1, mean = betas_abc_prior[4], sd = betas_abc_var[4])
+  beta4_abc_true <- rnorm(1, mean = betas_abc_prior[5], sd = betas_abc_var[5])
+  res$beta0_abc_true <- beta0_abc_true
+  res$beta1_abc_true <- beta1_abc_true
+  res$beta2_abc_true <- beta2_abc_true
+  res$beta3_abc_true <- beta3_abc_true
+  res$beta4_abc_true <- beta4_abc_true
+
+  if (abc_model == "linf" | abc_model == "minf") {
+    beta5_abc_true <- rtruncnorm(1, a = lower_bound, b = upper_bound, mean = betas_abc_prior[6], sd = betas_abc_var[6])
+    beta6_abc_true <- rtruncnorm(1, a = lower_bound, b = upper_bound, mean = betas_abc_prior[7], sd = betas_abc_var[7])
+    beta7_abc_true <- rtruncnorm(1, a = lower_bound, b = upper_bound, mean = betas_abc_prior[8], sd = betas_abc_var[8])
+    res$beta5_abc_true <- beta5_abc_true
+    res$beta6_abc_true <- beta6_abc_true
+    res$beta7_abc_true <- beta7_abc_true
+  }
+
+  # Generate covariates
+  X1_abc <- rnorm(n, mean = 0, sd = 1)
+  X2_abc <- rnorm(n, mean = 0, sd = 1)
+  X3_abc <- runif(n, min = 0, max = 1)
+
+  # Treatment assignment 50%:50%
+  trt_abc <- sample(c(rep(1, n / 2), rep(0, n / 2)))
+
+  if (abc_model == "ideal") {
+    lambda_abc <- exp(-(beta0_abc_true + beta1_abc_true * trt_abc + beta2_abc_true * X1_abc + beta3_abc_true * X2_abc + beta4_abc_true * X3_abc * trt_abc * I(X3_abc > d_subgr_obs)) / alpha)
+  } else if (abc_model == "linf" | abc_model == "minf") {
+    lambda_abc <- exp(-(beta0_abc_true + beta1_abc_true * trt_abc + beta2_abc_true * X1_abc + beta3_abc_true * X2_abc + beta4_abc_true * X3_abc + beta5_abc_true * trt_abc * X1_abc + beta6_abc_true * trt_abc * X2_abc + beta7_abc_true * trt_abc * X3_abc) / alpha)
+  }
+
+  # Generate event times and censoring times
+  time_event <- rweibull(n, scale = lambda_abc, shape = alpha) # Event times
+  time_cens_rand <- rexp(n, rate = rate) # Random censoring times
+  time_cens_recr <- runif(n, cens_admin - time_accr, cens_admin) # Recruitment censoring times
+
+  # Determine observed times and censoring indicators
+  time_cens <- pmin(time_cens_rand, time_cens_recr) # Minimum of random and recruitment censoring times
+  time_obs <- pmin(time_event, time_cens) # Observed times are the minimum of event and censoring times
+  delta <- ifelse(time_event < time_cens, 1, 0) # Censoring indicator (1 if event, 0 if censored)
+
+  # Create data frame with observed data
+  df_abc <- data.frame(id = seq(1, n), time = time_obs, cens = delta, X1 = X1_abc, X2 = X2_abc, X3 = X3_abc, trt = trt_abc)
+
+  # Calculate overall treatment effect in population
+  if (abc_model == "ideal") {
+    res$cate_pop_abc_true <- exp(mean(beta1_abc_true + beta4_abc_true * df_abc$X3 * I(df_abc$X3 > d_subgr_obs)))
+  } else if (abc_model == "linf" | abc_model == "minf") {
+    res$cate_pop_abc_true <- exp(mean(beta1_abc_true + beta5_abc_true * df_abc$X1 + beta6_abc_true * df_abc$X2 + beta7_abc_true * df_abc$X3))
+  }
+  # Calculate censoring proportions in each simulated dataset
+  res$cens_prop_abc <- nrow(df_abc[df_abc$cens == 0, ]) / n
+
+  # True ABC ITE
+  # Could be used do define the true subgroup or compare ITE in true and ABC subgroup
+  if (abc_model == "ideal") {
+    ite_abc_true <- exp(beta1_abc_true + beta4_abc_true * df_abc$X3 * I(df_abc$X3 > d_subgr_obs))
+  } else if (abc_model == "linf" | abc_model == "minf") {
+    ite_abc_true <- exp(beta1_abc_true + beta5_abc_true * df_abc$X1 + beta6_abc_true * df_abc$X2 + beta7_abc_true * df_abc$X3)
+  }
+  # True ABC subgroup
+  subgr_abc_true <- df_abc[df_abc$X3 > d_subgr_obs, ]
+
+  # Calculate conditional average treatment effect (CATE) in the true subgroup
+  # If there is no true subgroup, use the whole dataset
+  if (nrow(subgr_abc_true) == 0) {
+    subgr_abc_true <- df_abc
+    res$cate_true_abc <- res$cate_pop_abc_true
+  } else {
+    if (abc_model == "ideal") {
+      res$cate_pop_abc_true <- exp(mean(beta1_abc_true + beta4_abc_true * subgr_abc_true$X3 * I(subgr_abc_true$X3 > d_subgr_obs)))
+    } else if (abc_model == "linf" | abc_model == "minf") {
+      res$cate_pop_abc_true <- exp(mean(beta1_abc_true + beta5_abc_true * subgr_abc_true$X1 + beta6_abc_true * subgr_abc_true$X2 + beta7_abc_true * subgr_abc_true$X3))
+    }
+  }
+
+  # Estimate trt effect in ABC study population using marginal model
+  fit_pop_abc <- tryCatch(
+    coxph(data = df_abc, formula = Surv(time, cens) ~ trt, y = FALSE),
+    error = function(e) handler(e, "ABC", "Cox")
+  )
+  if (is.character(fit_pop_abc)) {
+    return(error_reject(res, fit_pop_abc))
+  }
+
+  res$cate_pop_abc <- exp(coef(fit_pop_abc)["trt"])
+
+  # Use subgroup identification method on ABC dataset
+  if (method == "LASSO") {
+    result_abc <- tryCatch(
+      ident_subgr_lasso(df_abc, d_ite = d_ite_lasso, penalty_param = penalty_param),
+      error = function(e) handler(e, "ABC", "Cox-LASSO")
+    )
+    if (is.character(result_abc)) {
+      return(error_reject(res, result_abc))
+    }
+
+    subgr_abc <- result_abc$subgr
+    res$pred_correct_abc <- result_abc$pred_correct
+    coefs_abc <- result_abc$coefs
+
+    coefs_abc_vec <- as.vector(coefs_abc)
+    names(coefs_abc_vec) <- paste0(rownames(coefs_abc), "_abc")
+    coefs_abc_df <- as.data.frame(t(coefs_abc_vec))
+    res <- cbind(res, coefs_abc_df)
+
+
+    # Calculate conditional average treatment effect (CATE) in the estimated ABC subgroup
+    if (nrow(subgr_abc) > 1) {
+      if (model == "full main") {
+        fit_abc <- tryCatch(
+          coxph(data = subgr_abc, formula = Surv(time, cens) ~ trt + X1 + X2 + X3, y = FALSE),
+          error = function(e) handler(e, "ABC", "Cox-LASSO CATE")
+        )
+        if (is.character(fit_abc)) {
+          return(error_reject(res, fit_abc))
+        }
+        res$cate_abc <- exp(coef(fit_abc))["trt"]
+      } else if (model == "dependent") {
+        fit_abc <- tryCatch(
+          exp(mean(log(subgr_abc$ite))),
+          error = function(e) handler(e, "ABC", "Cox-LASSO CATE")
+        )
+        if (is.character(fit_abc)) {
+          return(error_reject(res, fit_abc))
+        }
+        res$cate_abc <- fit_abc
+      } else if (model == "marginal") {
+        fit_abc <- tryCatch(
+          coxph(data = subgr_abc, formula = Surv(time, cens) ~ trt, y = FALSE),
+          error = function(e) handler(e, "ABC", "Cox-LASSO CATE")
+        )
+        if (is.character(fit_abc)) {
+          return(error_reject(res, fit_abc))
+        }
+        res$cate_abc <- exp(coef(fit_abc)["trt"])
+      }
+      if (abc_model == "ideal") {
+        res$cate_abc_true <- exp(mean(beta1_abc_true + beta4_abc_true * subgr_abc$X3 * I(subgr_abc$X3 > d_subgr_obs)))
+      } else if (abc_model == "linf" | abc_model == "minf") {
+        res$cate_abc_true <- exp(mean(beta1_abc_true + beta5_abc_true * subgr_abc$X1 + beta6_abc_true * subgr_abc$X2 + beta7_abc_true * subgr_abc$X3))
+      }
+    } else {
+      res$cate_abc <- NA
+      res$cate_abc_true <- NA
+    }
+  } else if (method == "MOB") {
+    result_abc <- tryCatch(
+      ident_subgr_mob(df_abc),
+      error = function(e) handler(e, "ABC", "Cox-MOB")
+    )
+    if (is.character(result_abc)) {
+      return(error_reject(res, result_abc))
+    }
+
+    subgr_abc_list <- result_abc$subgr_list
+
+    coefs_abc_df_list <- lapply(result_abc$coefs_list, function(coefs) {
+      coefs_vec <- as.vector(coefs[[1]])
+      names(coefs_vec) <- paste0(names(coefs[[1]]), "_abc")
+      df_coefs <- as.data.frame(t(coefs_vec))
+      df_coefs$node <- coefs[[2]]
+      return(df_coefs)
+    })
+
+    coefs <- bind_rows(coefs_abc_df_list)
+
+    subgr_cate_abc_list <- lapply(subgr_abc_list, function(subgr) {
+      if (model == "full main") {
+        fit_abc <- tryCatch(
+          coxph(data = subgr[[1]], formula = Surv(time, cens) ~ trt + X1 + X2 + X3, y = FALSE),
+          error = function(e) handler(e, "ABC", "Cox-MOB CATE")
+        )
+        if (is.character(fit_abc)) {
+          return(error_reject(res, fit_abc))
+        }
+        cate_abc <- exp(coef(fit_abc))["trt"]
+      } else if (model == "dependent") {
+        fit_abc <- tryCatch(
+          exp(coefs[coefs$node == subgr[[2]], "trt_abc"]),
+          error = function(e) handler(e, "ABC", "Cox-LASSO CATE")
+        )
+        if (is.character(fit_abc)) {
+          return(error_reject(res, fit_abc))
+        }
+        cate_abc <- fit_abc
+      } else if (model == "marginal") {
+        fit_abc <- tryCatch(
+          coxph(data = subgr[[1]], formula = Surv(time, cens) ~ trt, y = FALSE),
+          error = function(e) handler(e, "ABC", "Cox-MOB CATE")
+        )
+        if (is.character(fit_abc)) {
+          return(error_reject(res, fit_abc))
+        }
+        cate_abc <- exp(coef(fit_abc))["trt"]
+      }
+      return(list(subgr = subgr[[1]], cate = cate_abc, node = subgr[[2]]))
+    })
+
+    cates_abc <- sapply(subgr_cate_abc_list, function(subgr_cate) {
+      if (length(subgr_cate) == 3) {
+        return(subgr_cate$cate)
+      } else {
+        return(Inf)
+      }
+    })
+
+    selected <- subgr_cate_abc_list[[which.min(cates_abc)]]
+
+    subgr_abc <- selected$subgr
+    res$cate_abc <- selected$cate
+    node_subgr_abc <- selected$node
+
+    filter <- sapply(coefs_abc_df_list, function(df) {
+      if (df$node == node_subgr_abc) {
+        TRUE
+      } else {
+        FALSE
+      }
+    })
+    coefs_abc <- coefs_abc_df_list[filter]
+
+    res <- cbind(res, as.data.frame(coefs_abc))
+
+    # res$cate_abc <- result_abc$cate
+    if (abc_model == "ideal") {
+      res$cate_abc_true <- exp(mean(beta1_abc_true + beta4_abc_true * subgr_abc$X3 * I(subgr_abc$X3 > d_subgr_obs)))
+    } else if (abc_model == "linf" | abc_model == "minf") {
+      res$cate_abc_true <- exp(mean(beta1_abc_true + beta5_abc_true * subgr_abc$X1 + beta6_abc_true * subgr_abc$X2 + beta7_abc_true * subgr_abc$X3))
+    }
+    res$pred_correct_abc <- result_abc$pred_correct
+    nonzero_coefs_abc <- result_abc$nonzero_coefs
+  } else if (method == "Cox") {
+    result_abc <- tryCatch(
+      ident_subgr_cox(df_abc, d_ite = d_ite_lasso),
+      error = function(e) handler(e, "abc", "Cox-LASSO")
+    )
+    if (is.character(result_abc)) {
+      return(error_reject(res, result_abc))
+    }
+
+    subgr_abc <- result_abc$subgr
+    res$pred_correct_abc <- result_abc$pred_correct
+    significant_coefs_abc <- result_abc$significant_coefs
+    coefs_abc <- result_abc$coefs
+
+    coefs_abc_vec <- as.vector(coefs_abc)
+    names(coefs_abc_vec) <- paste0(names(coefs_abc), "_abc")
+    coefs_abc_df <- as.data.frame(t(coefs_abc_vec))
+    res <- cbind(res, coefs_abc_df)
+
+    # Calculate conditional average treatment effect (CATE) in the observed subgroup
+    if (nrow(subgr_abc) > 1) {
+      if (model == "full main") {
+        fit_abc <- tryCatch(
+          coxph(data = subgr_abc, formula = Surv(time, cens) ~ trt + X1 + X2 + X3, y = FALSE), #
+          error = function(e) handler(e, "abc", "Cox-LASSO CATE")
+        )
+        if (is.character(fit_abc)) {
+          return(error_reject(res, fit_abc))
+        }
+        res$cate_abc <- exp(coef(fit_abc)["trt"])
+      } else if (model == "dependent") {
+        fit_abc <- tryCatch(
+          exp(mean(log(subgr_abc$ite))),
+          error = function(e) handler(e, "abc", "Cox-MOB CATE")
+        )
+        if (is.character(fit_abc)) {
+          return(error_reject(res, fit_abc))
+        }
+        res$cate_abc <- fit_abc
+      } else if (model == "marginal") {
+        fit_abc <- tryCatch(
+          coxph(data = subgr_abc, formula = Surv(time, cens) ~ trt, y = FALSE),
+          error = function(e) handler(e, "abc", "Cox-LASSO CATE")
+        )
+        if (is.character(fit_abc)) {
+          return(error_reject(res, fit_abc))
+        }
+        res$cate_abc <- exp(coef(fit_abc)["trt"])
+      }
+      if (abc_model == "ideal") {
+        res$cate_abc_true <- exp(mean(beta1_abc_true + beta4_abc_true * subgr_abc$X3 * I(subgr_abc$X3 > d_subgr_obs)))
+      } else if (abc_model == "linf" | abc_model == "minf") {
+        res$cate_abc_true <- exp(mean(beta1_abc_true + beta5_abc_true * subgr_abc$X1 + beta6_abc_true * subgr_abc$X2 + beta7_abc_true * subgr_abc$X3))
+      }
+    } else {
+      res$cate_abc <- NA
+      res$cate_abc_true <- NA
+    }
+  } else {
+    stop("Method not supported")
+  }
+
+  res$subgr_size_abc_before <- nrow(subgr_abc)
+
+  # selection rules for observed subgroup beyond ident_subgrs
+  if (!is.na(res$cate_abc)) {
+    betas_abc_true <- c(beta0_abc_true, beta1_abc_true, beta2_abc_true, beta3_abc_true, beta4_abc_true) # , beta5_abc_true, beta6_abc_true, beta7_abc_true)
+    subgr_cate_abc <- select_subgr(n, subgr_abc, res$cate_abc, res$cate_pop_abc, res$cate_abc_true, df_abc, betas_abc_true, d_subgr_small, d_subgr_large, d_cate_pop)
+    subgr_abc <- subgr_cate_abc$subgr
+    res$cate_abc <- subgr_cate_abc$cate
+    res$cate_abc_true <- subgr_cate_abc$cate_true
+  }
+
+  res$subgr_size_abc_after <- nrow(subgr_abc)
+
+  # Overlap between true and observed subgroup
+  res$overlap_abc <- sum(subgr_abc$id %in% subgr_abc_true$id)
+  if (nrow(subgr_abc) != 0) {
+    # how many patients of the true subgroup are actually selected, i.e. are in the observed subgroup?
+    res$sensitivity_abc <- res$overlap_abc / nrow(subgr_abc_true)
+  } else {
+    res$sensitivity_abc <- NA
+  }
+  # how many patients of the observed subgroup are correctly selected, i.e. are in the true subgroup?
+  res$precision_abc <- res$overlap_abc / nrow(subgr_abc) # no check if nrow(subgr_abc) == 0 needed, because its automatically NaN
+
+  return(res)
+}
+```
+
+```{r, start_simulation, eval=T, echo=T}
+cur_libpaths <- .libPaths()
+start_sim <- function(K, N, betas_obs_true, betas_abc_prior, betas_abc_var, rate_opt_true, rate_opt_abc, cens_admin, time_accr, epsilon, penalty_param, d_subgr_small, d_subgr_large, d_cate_pop, total, method, model, cores = max(1, detectCores() - 2), seed = 764872) {
+  print("START_SIM")
+  RNGkind("L'Ecuyer-CMRG")
+  set.seed(seed)
+
+  # Avoid tiny run-to-run numeric drift from threaded BLAS/OpenMP in workers.
+  Sys.setenv(
+    OMP_NUM_THREADS = "1",
+    OPENBLAS_NUM_THREADS = "1",
+    MKL_NUM_THREADS = "1",
+    BLIS_NUM_THREADS = "1"
+  )
+
+  # Set up parallel processing
+  if (cores > 1) {
+    cl <- makeCluster(cores, outfile = "")
+    on.exit(stopCluster(cl))
+    clusterExport(cl, "cur_libpaths")
+    clusterEvalQ(cl, {renv:::renv_libpaths_set(cur_libpaths)})
+    clusterExport(cl, c("sim_abc", "sim_obs", "ident_subgr_mob", "ident_subgr_lasso", "ident_subgr_cox", "handler", "error_reject", "select_subgr", "reg_formula", "error_helper", "load_libraries", "d_subgr_obs", "d_cates_pop_diff", "d_subgr_small", "d_subgr_large", "d_cate_pop", "d_ite_lasso", "M", "a", "b", "alpha", "lower_bound", "upper_bound"))
+    clusterEvalQ(cl, {
+      Sys.setenv(
+        OMP_NUM_THREADS = "1",
+        OPENBLAS_NUM_THREADS = "1",
+        MKL_NUM_THREADS = "1",
+        BLIS_NUM_THREADS = "1"
+      )
+      RNGkind("L'Ecuyer-CMRG")
+      load_libraries()
+    })
+    clusterSetRNGStream(cl, iseed = seed)
+  } else {
+    cl <- NULL
+  }
+
+  results_obs <- pblapply(
+    1:K,
+    error_helper,
+    n = n,
+    betas_obs_true = betas_obs_true,
+    rate = rate_opt_true,
+    cens_admin = cens_admin,
+    time_accr = time_accr,
+    penalty_param = penalty_param,
+    d_subgr_small = d_subgr_small,
+    d_subgr_large = d_subgr_large,
+    d_cate_pop = d_cate_pop,
+    method = method,
+    model = model,
+    to_call = sim_obs,
+    cl = cl
+  )
+
+  results_abc <- pblapply(
+    1:N,
+    error_helper,
+    n = n,
+    betas_abc_prior = betas_abc_prior,
+    betas_abc_var = betas_abc_var,
+    rate = rate_opt_abc,
+    cens_admin = cens_admin,
+    time_accr = time_accr,
+    epsilon = epsilon,
+    penalty_param = penalty_param,
+    d_subgr_small = d_subgr_small,
+    d_subgr_large = d_subgr_large,
+    d_cate_pop = d_cate_pop,
+    lower_bound = lower_bound,
+    upper_bound = upper_bound,
+    method = method,
+    model = model,
+    abc_model = abc_model,
+    to_call = sim_abc,
+    cl = cl
+  )
+
+  return(list(results_obs = results_obs, results_abc = results_abc))
+}
+```
+
+```{r, results, eval=T, echo=T}
+start_simulation_time <- Sys.time()
+results <- start_sim(K, N, betas_obs_true, betas_abc_prior, betas_abc_var, rate_opt_true, rate_opt_abc, cens_admin, time_accr, epsilon, penalty_param, d_subgr_small, d_subgr_large, d_cate_pop, total, method = method, model = model)
+end_simulation_time <- Sys.time()
+message(str_glue("Time for simulations: {round(difftime(end_simulation_time, start_simulation_time, units = 'mins'), 2)} minutes"))
+
+check_for_errors <- function(results) {
+  conditions <- sapply(results, \(x) "condition" %in% class(x))
+  if (any(conditions)) {
+    error_messages <- sapply(results[conditions], as.character)
+    indices <- which(conditions)
+    error_frame <- data.frame(
+      sim = indices,
+      error_message = error_messages
+    ) %>%
+      group_by(error_message) %>%
+      summarise(sims = paste0(" ", sim, collapse = ", "))
+    for (i in 1:nrow(error_frame)) {
+      message <- error_frame[i, ]
+      message(str_glue("{i}. Error in {length(message$sims)} simulations ({message$sims}): {message$error_message}"))
+    }
+    flush.console()
+    Sys.sleep(1)
+    stop("Errors in simulations!")
+  }
+}
+
+check_for_errors(results$results_obs)
+check_for_errors(results$results_abc)
+
+start_bind_rows_obs_time <- Sys.time()
+bind_rows(results$results_obs) %>% write_csv(file.path(outdir, "results_obs.csv"))
+end_bind_rows_obs_time <- Sys.time()
+message(str_glue("Time for binding and writing obs results: {round(difftime(end_bind_rows_obs_time, start_bind_rows_obs_time, units = 'secs'), 2)} minutes"))
+
+start_bind_rows_abc_time <- Sys.time()
+bind_rows(results$results_abc) %>% write_csv(file.path(outdir, "results_abc.csv"))
+end_bind_rows_abc_time <- Sys.time()
+message(str_glue("Time for binding and writing abc results: {round(difftime(end_bind_rows_abc_time, start_bind_rows_abc_time, units = 'mins'), 2)} minutes"))
+```
+
+# Check rejection criterions and get posteriors
+
+```{r, posteriors, eval=T, echo=T}
+# acceptance criteria for ABC results
+accept_criteria <- function(cur_obs, results_abc, d_cates_pop_diff, d_subgr_size, epsilon) {
+  abc_accepted <- results_abc[(abs(cur_obs$cate_obs - cate_abc) < epsilon) & (abs(cur_obs$subgr_size_after - subgr_size_abc_after) < d_subgr_size), ] # & (abs(cur_obs$subgr_size_after - subgr_size_abc_after) < d_subgr_size) #& (subgr_size_abc_after < maxsize) & (subgr_size_abc_after < maxsize)
+  abc_rejected <- setdiff(results_abc$j, abc_accepted$j)
+  both_accepted <- abc_accepted[abs(cate_pop_abc - cur_obs$cate_pop_obs) <= d_cates_pop_diff, j]
+  popdiff_rejected <- setdiff(abc_accepted$j, both_accepted)
+  return(list(abc_rejected, popdiff_rejected, both_accepted))
+}
+
+get_posteriors <- function(path_obs, path_abc, n, d_subgr_obs, d_cates_pop_diff, d_min_post, M, epsilon) {
+  require(data.table)
+  results_obs <- fread(path_obs, stringsAsFactors = TRUE, select = c("i", "cate_obs", "cate_pop_obs", "subgr_size_after", "rejected", "rejection_reason"))
+  total_obs <- nrow(results_obs)
+  results_abc <- fread(path_abc, stringsAsFactors = TRUE, select = c("j", "cate_abc", "cate_pop_abc", "subgr_size_abc_after", "rejected", "rejection_reason"))
+  total_abc <- nrow(results_abc)
+
+  results_obs_rejected <- results_obs[rejected == TRUE, .(n_iteration = .N, n_total = .N * total_abc, rejection_type = "obs"), by = "rejection_reason"]
+  accepted_obs <- total_obs - sum(results_obs_rejected$n_iteration)
+  results_abc_rejected <- results_abc[rejected == TRUE, .(n_abcsim = .N, n_total = .N * accepted_obs, rejection_type = "abc"), by = "rejection_reason"]
+
+  results_obs <- results_obs[rejected == FALSE, .(i, cate_obs, cate_pop_obs, subgr_size_after)]
+  results_abc <- results_abc[rejected == FALSE, .(j, cate_abc, cate_pop_abc, subgr_size_abc_after)]
+
+  get_accepted_j <- function(rownumber) {
+    cur_obs <- results_obs[rownumber, ]
+    accept_criteria(cur_obs, results_abc, d_cates_pop_diff, d_subgr_size, epsilon)
+  }
+  j_comparisons <- pblapply(seq_len(nrow(results_obs)), get_accepted_j)
+
+  abc_rejections <- data.table(
+    rejection_reason = "ABC criterion not met", rejection_type = "comp",
+    n_iteration = sum(sapply(j_comparisons, \(x)length(x[[1]]) > 0)), n_total = sum(sapply(j_comparisons, \(x) (length(x[[1]]))))
+  )
+
+  popdiff_rejections <- data.table(
+    rejection_reason = "Populations too different", rejection_type = "comp",
+    n_iteration = sum(sapply(j_comparisons, \(x)length(x[[2]]) > 0)), n_total = sum(sapply(j_comparisons, \(x) (length(x[[2]]))))
+  )
+
+  rejection_reason_table <- rbindlist(list(abc_rejections, popdiff_rejections, results_obs_rejected, results_abc_rejected), fill = TRUE)
+
+  alljs <- lapply(j_comparisons, \(x) x[[3]])
+  lengths <- sapply(alljs, length)
+  filterlen <- lengths >= d_min_post
+  alljs <- alljs[filterlen]
+  return(list(posts = data.table(i = results_obs[filterlen, i], accepted = alljs), rejection_reason_table = rejection_reason_table, hidden_obs = sum(!filterlen)))
+}
+
+path_obs <- file.path(outdir, "results_obs.csv")
+path_abc <- file.path(outdir, "results_abc.csv")
+
+posts_info <- get_posteriors(path_obs, path_abc, n, d_subgr_obs, d_cates_pop_diff, d_min_post, M, epsilon)
+
+rejection_reason_table <- posts_info$rejection_reason_table
+hidden_obs <- posts_info$hidden_obs
+posts <- posts_info$posts
+```
+
+## Estimate true treatment effect
+
+```{r, estimate_true_treatment_effect, eval=T, echo=T}
+estimate_mode <- function(x, na.rm = FALSE) {
+  if (na.rm == TRUE) {
+    x <- na.omit(x)
+  }
+  if (length(x) >= 2) {
+    d <- density(x, na.rm = na.rm)
+    mode <- d$x[which.max(d$y)]
+  } else if (length(x) == 1) {
+    mode <- x
+  } else {
+    mode <- NA_real_
+  }
+  return(mode)
+}
+
+get_estimates <- function(path_obs, path_abc, posts_ind, method = c("LASSO", "MOB", "Cox")) {
+  method <- match.arg(method)
+  i_tokeep <- posts_ind$i
+  j_tokeep <- unique(unlist(posts_ind$accepted))
+
+  if (method == "LASSO" || method == "Cox") {
+    results_obs <- fread(path_obs, stringsAsFactors = TRUE, select = c("i", "cate_obs_true", "cate_obs", "cate_pop_true", "cate_true", "subgr_size_after", "trt_obs", "X1_obs", "X2_obs", "X3_obs", "X1:X2_obs", "X1:X3_obs", "X2:X3_obs", "X1:trt_obs", "X2:trt_obs", "X3:trt_obs"), index = "i")[i %in% i_tokeep, ] # "X1:X2_obs", "X1:X3_obs", "X2:X3_obs",
+  } else if (method == "MOB") {
+    results_obs <- fread(path_obs, stringsAsFactors = TRUE, select = c("i", "cate_obs_true", "cate_obs", "cate_pop_true", "cate_true", "subgr_size_after", "trt_obs", "X1_obs", "X2_obs", "X3_obs"), index = "i")[i %in% i_tokeep, ]
+  } else {
+    stop("Method not supported")
+  }
+  results_abc <- fread(path_abc, stringsAsFactors = TRUE, select = c("j", "cate_abc_true"), index = "j")[j %in% j_tokeep, ]
+
+  join_and_analyze <- function(js) {
+    # print(js)
+    joined <- results_abc[js, .(
+      post_mean = mean(cate_abc_true, na.rm = TRUE),
+      post_median = median(cate_abc_true, na.rm = TRUE),
+      post_mode = estimate_mode(cate_abc_true, na.rm = TRUE),
+      post_min = min(cate_abc_true, na.rm = TRUE),
+      post_max = max(cate_abc_true, na.rm = TRUE), n = .N
+    ), nomatch = 0L, on = "j"]
+
+    return(joined)
+  }
+
+  ests <- posts_ind[, join_and_analyze(accepted), by = "i"]
+  combined <- ests[results_obs, , on = "i"]
+  return(combined)
+}
+
+estimates <- get_estimates(path_obs, path_abc, posts, method)
+write_csv(estimates, file.path(outdir, "estimates.csv"))
+```
